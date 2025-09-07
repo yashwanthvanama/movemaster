@@ -1,0 +1,12 @@
+[project]
+name = "movemaster"
+version = "0.1.0"
+description = "AI engine that predicts the next chess move from prior moves/position"
+authors = [{ name = "Your Name" }]
+requires-python = ">=3.10"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

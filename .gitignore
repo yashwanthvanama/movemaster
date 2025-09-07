@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environment
+.venv/
+.env
+
+# Python tooling
+.mypy_cache/
+.pytest_cache/
+
+# OS
+.DS_Store
+
+# Data
+/data/
+*.pgn
+*.binpack
+*.zst
+*.csv
+
+# Models
+/models/
+*.pt
+*.pth
+
+# Notebooks
+*.ipynb_checkpoints/
