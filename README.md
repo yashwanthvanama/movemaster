@@ -1,145 +1,189 @@
 # MoveMaster
 
-MoveMaster is an AI engine that predicts the next chess move from prior moves and/or the current position. It includes a training pipeline on public chess datasets, an evaluation harness with a minimax baseline, and a production-ready FastAPI service for inference.
+An AI engine for predicting the next chess move from a position (FEN) with a lightweight policy network, evaluation utilities, a minimax + MCTS baseline, and a production FastAPI service.
 
-## Overview
+## Highlights
+- Kaggle-only supervised data (FEN + evaluation score) with optional move label generation via minimax.
+- Feature encoder: 18-plane bitboard representation (12 piece planes + side-to-move + castling + en-passant).
+- Policy model: small convolutional net (default) producing logits over a fixed UCI move vocabulary.
+- Optional GPT-style tokenizer + GPT wrapper (experimental) for sequence-based modeling (see `GPTMoveTokenizer`, `GPTPolicy`).
+- Baselines: Alpha-beta minimax (piece-square tables + mobility) and a lightweight MCTS (random rollouts + static eval).
+- Training loop: mixed precision (AMP), gradient clipping, cosine LR with warmup, early stopping, top-1 & top-k metrics, artifact management.
+- Evaluation:
+  - JSONL dataset evaluation (top-1 / top-k accuracy, perplexity, optional minimax agreement) → Markdown report.
+  - Arena: policy vs minimax match play with alternating colors, PGN export, Wilson 95% CI.
+- FastAPI service (v2) exposing `/healthz`, `/next_move`, `/mcts_move` with lazy model loading and legal move masking.
+- Tests (pytest + coverage): tokenizer, PGN parsing, minimax legality, API endpoints.
+- Multi-stage Docker image (Python 3.11) with minimal runtime layer.
 
-- Objective: Given a chess position or sequence of moves, predict the best next move.
-- Core components:
-  - Data ingestion from Kaggle Chess Evaluations only.
-  - Feature extraction using python-chess (bitboards, legal move masks, SAN/uci parsing).
-  - Model: lightweight neural network (PyTorch) for move policy; optional value head.
-  - Baseline: classic minimax with alpha-beta pruning (depth-limited) using a simple material/positional eval.
-  - Training loop with batching, mixed precision, checkpoints.
-  - Evaluation: top-1 accuracy over test positions, engine matchups vs minimax, and calibration.
-  - Serving: FastAPI endpoints for health, predict, and analyze (minimax) with Docker support.
-
-## Dataset Source (Kaggle Only)
-
-- Kaggle Chess Evaluations: https://www.kaggle.com/datasets/ronakbadhe/chess-evaluations (or similar)
-  - Contains positions in FEN with engine evaluations and best move labels.
-  - Expected columns: FEN (or fen), BestMove (or best_move/move/bestmove). Others ignored.
-  - Use FEN -> board via python-chess to create supervised targets.
-
-Data usage notes:
-- Verify the Kaggle dataset license and attribution requirements.
-- Keep raw downloads outside repo (gitignored). Place under `data/raw/`.
-
-## Project Structure
-
+## Repository Structure
 ```
 movemaster/
 ├── README.md
-├── pyproject.toml
 ├── requirements.txt
-├── Dockerfile
+├── pyproject.toml
+├── Dockerfile                 # Multi-stage builder/runtime
+├── artifacts/                 # (Optional) Saved models (e.g., policy_best.pt)
 ├── scripts/
-│   └── preprocess.sh            # Preprocess Kaggle CSV → NPZ shards
+│   └── preprocess.sh          # CSV -> NPZ shard (with minimax label gen)
 ├── src/movemaster/
-│   ├── __init__.py
 │   ├── api/
-│   │   ├── __init__.py
-│   │   └── server.py            # FastAPI app
+│   │   ├── app.py             # FastAPI v2 (next_move, mcts_move)
+│   │   └── server.py          # Legacy API (/predict, /analyze)
+│   ├── service/api.py         # Service entrypoint re-export
 │   ├── data/
-│   │   ├── datasets.py          # NPZ shard loader
-│   │   └── preprocess.py        # FEN/CSV parsing to tensors
+│   │   ├── preprocess.py      # CSV preprocessing & feature encoding
+│   │   └── datasets.py        # NPZ shard iterator
 │   ├── models/
-│   │   ├── policy.py            # PyTorch model
-│   │   └── minimax.py           # Baseline with alpha-beta
-│   ├── training/
-│   │   ├── train.py             # Training loop
-│   │   └── utils.py             # Training utils, metrics, ckpt
-│   └── eval/
-│       └── evaluate.py          # Metrics & vs minimax
-└── tests/
-    └── test_api.py
+│   │   ├── policy.py          # Conv policy + GPT tokenizer/wrapper
+│   │   └── minimax.py         # Alpha-beta with PST + choose_move
+│   ├── training/train.py      # Enhanced training loop
+│   ├── eval/
+│   │   ├── evaluate.py        # JSONL metrics & report
+│   │   └── arena.py           # Policy vs minimax arena
+│   └── tests/...              # (Runtime installed via root tests/)
+├── tests/                     # Pytest test suite
+└── data/
+    ├── raw/                   # Raw CSV (gitignored)
+    └── processed/             # NPZ shards (gitignored)
 ```
 
-## Training Flow
+## Data Pipeline (Kaggle Chess Evaluations)
+The project assumes a CSV (e.g., `chessData.csv`) with at least:
+- `FEN` — position.
+- `Evaluation` — engine centipawn score (optional for training; used for future enhancements).
 
-1. Download Kaggle CSV
-   - Download the Kaggle Chess Evaluations CSV and place it at `data/raw/chess_evaluations.csv`.
-2. Preprocess
-   - Parse positions (FEN) with python-chess.
-   - For each position, generate features:
-     - Bitboard planes (12 piece planes + side to move + castling + en passant).
-     - Legal move mask over the fixed UCI move vocabulary.
-   - Target: next move index (from BestMove column).
-   - Save to `.npz` shards in `data/processed/`.
-3. Train
-   - PyTorch model (small ConvNet) over planes.
-   - Loss: cross-entropy on legal moves only (masking illegal moves during eval/inference).
-   - Optim: AdamW, cosine LR optional, mixed precision optional.
-   - Checkpoint: best val accuracy and last.
-4. Evaluate
-   - Top-1 accuracy and top-k on held-out set or random positions agreement with minimax.
+If a move label column (e.g., `BestMove`) is missing, we generate a next-move label via a shallow minimax search using `--minimax-depth`.
 
-## Minimax Baseline
-
-- Implementation: alpha-beta with simple evaluation:
-  - Material balance + mobility term.
-- Depth: configurable (e.g., 2–4 plies) to keep it fast.
-- Used as a sanity check and comparison for learned policy.
-
-## FastAPI Endpoints
-
-- GET `/health` → `{ status: "ok" }`
-- POST `/predict` → Input: `{ fen: string, top_k?: int }` Output: `{ moves: [{uci, prob}], legal_moves: [uci] }`
-- POST `/analyze` → Input: `{ fen: string, depth?: int }` Output: `{ best_move: uci, score: centipawns }` (minimax)
-
-## How to Run Locally
-
-- Set up environment
-  - Python 3.10+
-  - Create venv and install dependencies
-
+### Preprocess
 ```
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+bash scripts/preprocess.sh data/raw/chessData.csv data/processed/shard_000.npz 100000 2
 ```
+Args: CSV path, output NPZ, max samples, minimax depth for label generation.
 
-- Preprocess Kaggle CSV (assumes `data/raw/chess_evaluations.csv` exists)
-```
-bash scripts/preprocess.sh  # writes data/processed/shard_000.npz
-```
+This writes a compressed NPZ with:
+- `features`: (N, 18, 8, 8)
+- `labels`: (N,) indices into the fixed UCI move vocabulary.
 
-- Train (example)
+## Training
+Enhanced training loop (conv policy):
 ```
 python -m src.movemaster.training.train \
   --data-dir data/processed \
-  --epochs 2 --batch-size 256 --lr 3e-4 \
-  --out models/policy.pt
+  --epochs 20 \
+  --batch-size 256 \
+  --lr 3e-4 \
+  --amp \
+  --grad-clip 1.0 \
+  --patience 4 \
+  --topk 3 \
+  --warmup 2 \
+  --artifacts-dir artifacts
+```
+Artifacts saved to:
+- `artifacts/policy_best.pt` (best val top-1 accuracy)
+- `artifacts/policy_last.pt` (last epoch)
+
+## Evaluation
+### JSONL Metrics
+Prepare a JSONL with lines: `{ "fen": "...", "next_move": "e2e4" }`
+```
+python -m src.movemaster.eval.evaluate \
+  --jsonl data/processed/test_positions.jsonl \
+  --topk 3 \
+  --report artifacts/eval_report.md
+```
+Outputs top-1 accuracy, top-k accuracy, perplexity, optional minimax agreement.
+
+### Arena (Policy vs Minimax)
+```
+python -m src.movemaster.eval.arena \
+  --games 20 \
+  --minimax-depth 3 \
+  --move-limit 200 \
+  --out-dir artifacts/arena
+```
+Generates PGNs and `arena_report.md` with W/L/D and Wilson 95% CI.
+
+## FastAPI Service
+Primary app: `src.movemaster.api.app:app`
+
+Endpoints:
+- `GET /healthz` → `{ "status": "ok" }`
+- `POST /next_move` → body: `{ fen: str, top_k: int }` → top-k moves with probabilities
+- `POST /mcts_move` → body: `{ fen: str, n_simulations: int, max_rollout_depth?: int, c_puct?: float }`
+
+Example (local):
+```
+uvicorn src.movemaster.api.app:app --host 0.0.0.0 --port 8000
+```
+```
+curl -s -X POST localhost:8000/next_move \
+  -H 'Content-Type: application/json' \
+  -d '{"fen":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1","top_k":5}'
 ```
 
-- Evaluate vs minimax
-```
-python -m src.movemaster.eval.evaluate --num-positions 100 --minimax-depth 3
-```
+Model path override: `MOVEMASTER_MODEL=artifacts/policy_best.pt` environment variable.
 
-- Run API
-```
-uvicorn src.movemaster.api.server:app --reload --port 8000
-```
+Legacy endpoints (`/predict`, `/analyze`) remain in `server.py` but are superseded by `/next_move` and `/mcts_move`.
 
-- Example curl
+## Minimax & MCTS
+- Minimax uses alpha-beta with piece-square tables & mobility; select depth via `depth` argument.
+- `choose_move(fen, depth=3)` returns best move UCI.
+- MCTS (service only) uses random rollouts + static evaluation for approximate search.
+
+## GPT Tokenizer (Experimental)
+`GPTMoveTokenizer` & `GPTPolicy` (in `policy.py`) provide a move+FEN hashed token space. Not wired into training script yet; can be integrated for sequence-based modeling.
+
+## Testing
 ```
-curl -X POST localhost:8000/predict -H 'Content-Type: application/json' \
-  -d '{"fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"}'
+pip install -r requirements.txt
+pytest -q --cov=src/movemaster --cov-report=term-missing
 ```
+Covers: tokenizer, PGN parsing, minimax legality, API endpoints.
 
 ## Docker
-
-- Build
+Multi-stage build:
 ```
 docker build -t movemaster:latest .
 ```
-- Run API
+Run:
 ```
 docker run --rm -p 8000:8000 movemaster:latest
 ```
+Override model file (mount host artifacts):
+```
+docker run --rm -p 8000:8000 \
+  -e MOVEMASTER_MODEL=/app/artifacts/policy_best.pt \
+  -v $(pwd)/artifacts:/app/artifacts \
+  movemaster:latest
+```
 
-## Notes
+## Quick Start Summary
+1. Download Kaggle CSV to `data/raw/chessData.csv`.
+2. Preprocess: `bash scripts/preprocess.sh data/raw/chessData.csv data/processed/shard_000.npz 50000 2`
+3. Train model (see command above) → artifacts/policy_best.pt.
+4. Evaluate JSONL or run arena.
+5. Serve API (local or Docker) and query `/next_move`.
 
-- This setup uses only Kaggle Chess Evaluations for training.
-- The default model is small and CPU-friendly; swap in larger architectures as needed.
+## Roadmap Ideas
+- Integrate GPTPolicy into training & inference.
+- Add temperature / nucleus sampling for move generation.
+- Quiescence search & iterative deepening for minimax.
+- Stronger MCTS with neural policy priors & value head.
+- ELO estimation via SPRT.
+
+## License & Data
+- Kaggle dataset usage subject to its license—verify before redistribution.
+- Code provided as-is (add appropriate license file if distributing).
+
+## Troubleshooting
+| Issue | Hint |
+|-------|------|
+| No `policy_best.pt` found | Train first or set `MOVEMASTER_MODEL` to existing checkpoint. |
+| /next_move returns empty moves | Position likely terminal; check FEN. |
+| Slow minimax | Reduce depth (2) or move limit; consider pruning enhancements. |
+| High Docker image size | Remove dev deps / tests or switch base to `python:3.11-slim` (already used). |
+
+---
+MoveMaster: compact chess move prediction & evaluation toolkit.
